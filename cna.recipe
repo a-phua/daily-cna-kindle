@@ -1,4 +1,8 @@
+from datetime import datetime, timedelta, timezone
 from calibre.web.feeds.news import BasicNewsRecipe
+
+SGT = timezone(timedelta(hours=8))
+
 
 class ChannelNewsAsia(BasicNewsRecipe):
     title = 'Channel NewsAsia'
@@ -6,6 +10,8 @@ class ChannelNewsAsia(BasicNewsRecipe):
     max_articles_per_feed = 15
     auto_cleanup = True
     language = 'en_SG'
+    compress_news_images = True
+    compress_news_images_max_size = 10
 
     feeds = [
         ('Singapore', 'https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=10416'),
@@ -13,3 +19,97 @@ class ChannelNewsAsia(BasicNewsRecipe):
         ('Business', 'https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=6936'),
         ('World', 'https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=6311'),
     ]
+
+    def __init__(self, *args, **kwargs):
+        now_sgt = datetime.now(SGT)
+        # Ensure the Kindle library title uses SGT rather than UTC
+        self.timefmt = now_sgt.strftime(' [%a, %d %b %Y]')
+        super().__init__(*args, **kwargs)
+
+    def default_cover(self, cover_file):
+        now_sgt = datetime.now(SGT)
+        day_name = now_sgt.strftime('%A').upper()
+        date_line = now_sgt.strftime('%d %B %Y')
+        full_date = now_sgt.strftime('%A, %d %B %Y')
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            from calibre.utils.resources import get_path as P
+
+            width, height = 1200, 1600
+            img = Image.new('RGB', (width, height), '#FFFFFF')
+            draw = ImageDraw.Draw(img)
+
+            font_masthead = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 72)
+            font_edition = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 30)
+            font_day = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 46)
+            font_date = ImageFont.truetype(P('fonts/liberation/LiberationSerif-Bold.ttf'), 84)
+            font_sections = ImageFont.truetype(P('fonts/liberation/LiberationSans-Regular.ttf'), 34)
+
+            # Outer border
+            draw.rectangle([48, 48, width - 48, height - 48], outline='#111111', width=4)
+
+            # Top dark masthead banner
+            draw.rectangle([48, 48, width - 48, 280], fill='#111111')
+            draw.text((width // 2, 164), 'CHANNEL NEWSASIA', fill='#FFFFFF', font=font_masthead, anchor='mm')
+
+            # Edition sub-banner
+            draw.text((width // 2, 345), 'MORNING DIGEST  •  SINGAPORE', fill='#333333', font=font_edition, anchor='mm')
+            draw.line([140, 395, width - 140, 395], fill='#111111', width=3)
+
+            # Center date block
+            draw.text((width // 2, 690), day_name, fill='#444444', font=font_day, anchor='mm')
+            draw.text((width // 2, 790), date_line, fill='#111111', font=font_date, anchor='mm')
+
+            # Bottom section list
+            draw.line([140, 1340, width - 140, 1340], fill='#111111', width=3)
+            draw.text(
+                (width // 2, 1410),
+                'Singapore   •   Asia   •   Business   •   World',
+                fill='#222222',
+                font=font_sections,
+                anchor='mm',
+            )
+
+            img.save(cover_file, format='JPEG', quality=90)
+            return True
+
+        except Exception:
+            # Fallback to Calibre's built-in cover generator if fonts differ
+            from calibre.ebooks.covers import generate_cover
+            data = generate_cover('Channel NewsAsia', authors=[full_date])
+            cover_file.write(data)
+            return True
+
+    def preprocess_html(self, soup):
+        # Convert <picture> elements into standard <img> tags before auto_cleanup runs
+        for picture in soup.find_all('picture'):
+            img = picture.find('img')
+            source = picture.find('source')
+            img_url = None
+
+            if source and source.get('srcset'):
+                img_url = source['srcset'].split(',')[0].strip().split(' ')[0]
+            elif img:
+                img_url = img.get('data-src') or img.get('data-original') or img.get('src')
+
+            if img_url:
+                if img_url.startswith('//'):
+                    img_url = 'https:' + img_url
+                new_img = soup.new_tag('img', src=img_url)
+                picture.replace_with(new_img)
+
+        # Normalize standalone lazy-loaded <img> tags
+        for img in soup.find_all('img'):
+            real_src = img.get('data-src') or img.get('data-original')
+            if not real_src and img.get('srcset'):
+                real_src = img['srcset'].split(',')[0].strip().split(' ')[0]
+            if real_src:
+                if real_src.startswith('//'):
+                    real_src = 'https:' + real_src
+                img['src'] = real_src
+            for attr in ('data-src', 'data-original', 'srcset', 'loading'):
+                if attr in img.attrs:
+                    del img.attrs[attr]
+
+        return soup
