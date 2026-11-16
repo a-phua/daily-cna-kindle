@@ -24,10 +24,11 @@ class ChannelNewsAsia(BasicNewsRecipe):
     def __init__(self, *args, **kwargs):
         now_sgt = datetime.now(SGT)
         self.timefmt = now_sgt.strftime(' [%a, %d %b %Y]')
+        self._hero_images = {}
         super().__init__(*args, **kwargs)
 
     def _clean_img_url(self, raw_url):
-        if not raw_url:
+        if not raw_url or not isinstance(raw_url, str):
             return None
         url = raw_url.strip().split(',')[0].strip().split(' ')[0]
         if not url or url.startswith('data:'):
@@ -35,7 +36,26 @@ class ChannelNewsAsia(BasicNewsRecipe):
         lower = url.lower()
         if any(skip in lower for skip in ('logo', 'icon', 'avatar', 'placeholder', '.svg')):
             return None
-        return urljoin('https://www.channelnewsasia.com/', url)
+        full_url = urljoin('https://www.channelnewsasia.com/', url)
+        if 'dam.mediacorp.sg' in full_url:
+            full_url = full_url.replace('f_auto', 'f_jpg')
+        return full_url
+
+    def _extract_key(self, soup):
+        h1 = soup.find('h1')
+        if h1:
+            txt = ' '.join(h1.get_text().split()).strip().lower()
+            if txt:
+                return txt
+        title = soup.find('title')
+        if title:
+            txt = ' '.join(title.get_text().split()).strip().lower()
+            for suffix in (' - cna', ' | cna', ' - channel newsasia'):
+                if txt.endswith(suffix):
+                    txt = txt[:-len(suffix)].strip()
+            if txt:
+                return txt
+        return None
 
     def default_cover(self, cover_file):
         now_sgt = datetime.now(SGT)
@@ -91,4 +111,62 @@ class ChannelNewsAsia(BasicNewsRecipe):
         og_img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
         if og_img and og_img.get('content'):
             hero_url = self._clean_img_url(og_img['content'])
-        soup._cna_hero_url = hero
+
+        # Convert inline <picture> tags into <p><img ...></p> so auto_cleanup keeps them
+        for picture in soup.find_all('picture'):
+            img = picture.find('img')
+            source = picture.find('source')
+            raw = None
+            if source and source.get('srcset'):
+                raw = source['srcset']
+            elif img:
+                raw = img.get('data-src') or img.get('data-original') or img.get('srcset') or img.get('src')
+
+            clean_url = self._clean_img_url(raw)
+            if clean_url:
+                if not hero_url:
+                    hero_url = clean_url
+                p_tag = soup.new_tag('p')
+                new_img = soup.new_tag('img', src=clean_url)
+                p_tag.append(new_img)
+                picture.replace_with(p_tag)
+            else:
+                picture.decompose()
+
+        # Normalize standalone lazy-loaded <img> tags
+        for img in soup.find_all('img'):
+            raw = img.get('data-src') or img.get('data-original') or img.get('srcset') or img.get('src')
+            clean_url = self._clean_img_url(raw)
+            if clean_url:
+                if not hero_url:
+                    hero_url = clean_url
+                img['src'] = clean_url
+                for attr in ('data-src', 'data-original', 'srcset', 'loading'):
+                    if attr in img.attrs:
+                        del img.attrs[attr]
+            else:
+                img.decompose()
+
+        key = self._extract_key(soup)
+        if key and hero_url:
+            self._hero_images[key] = hero_url
+
+        return soup
+
+    def postprocess_html(self, soup, first_fetch):
+        # Re-insert the hero photo right under the headline after auto_cleanup runs
+        existing_srcs = {img.get('src') for img in soup.find_all('img') if img.get('src')}
+        key = self._extract_key(soup)
+        hero_url = self._hero_images.pop(key, None) if key else None
+
+        if hero_url and hero_url not in existing_srcs:
+            p_tag = soup.new_tag('p')
+            img_tag = soup.new_tag('img', src=hero_url)
+            p_tag.append(img_tag)
+            h1 = soup.find('h1')
+            if h1 and h1.parent:
+                h1.insert_after(p_tag)
+            elif soup.body:
+                soup.body.insert(0, p_tag)
+
+        return soup
