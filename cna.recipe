@@ -12,6 +12,11 @@ class ChannelNewsAsia(BasicNewsRecipe):
     max_articles_per_feed = 15
     auto_cleanup = False
     language = 'en_SG'
+    user_agent = (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/131.0.0.0 Safari/537.36'
+    )
     scale_news_images_to_device = True
     compress_news_images = True
     compress_news_images_max_size = 35
@@ -30,7 +35,14 @@ class ChannelNewsAsia(BasicNewsRecipe):
 
     def get_browser(self):
         br = super().get_browser()
-        br.addheaders += [('Referer', 'https://www.channelnewsasia.com/')]
+        br.addheaders = [
+            (k, v) for k, v in br.addheaders
+            if k.lower() not in ('accept', 'referer')
+        ]
+        br.addheaders += [
+            ('Referer', 'https://www.channelnewsasia.com/'),
+            ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/jpeg,image/png,*/*;q=0.8'),
+        ]
         return br
 
     def _clean_img_url(self, raw_url, is_srcset=False):
@@ -72,7 +84,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
         return None
 
     def _normalize_media(self, container, soup):
-        for picture in container.find_all('picture'):
+        for picture in list(container.find_all('picture')):
             img = picture.find('img')
             source = picture.find('source')
             clean_url = None
@@ -89,7 +101,9 @@ class ChannelNewsAsia(BasicNewsRecipe):
             else:
                 picture.decompose()
 
-        for img in container.find_all('img'):
+        for img in list(container.find_all('img')):
+            if img.attrs is None:
+                continue
             clean_url = None
             for attr, is_ss in (('data-src', False), ('data-original', False), ('srcset', True), ('src', False)):
                 if img.get(attr):
@@ -176,6 +190,9 @@ class ChannelNewsAsia(BasicNewsRecipe):
             return True
 
     def preprocess_html(self, soup):
+        if not soup.body:
+            return soup
+
         headline = self._extract_headline(soup)
 
         hero_url = None
@@ -183,10 +200,10 @@ class ChannelNewsAsia(BasicNewsRecipe):
         if og_img and og_img.get('content'):
             hero_url = self._clean_img_url(og_img['content'], is_srcset=False)
 
-        for junk in soup.find_all(['script', 'style', 'noscript', 'iframe', 'svg', 'form']):
+        for junk in list(soup.find_all(['script', 'style', 'noscript', 'iframe', 'svg', 'form'])):
             junk.decompose()
 
-        root = soup.find('main') or soup.find('article') or soup.body or soup
+        root = soup.find('main') or soup.find('article') or soup.body
         self._normalize_media(root, soup)
 
         if not hero_url:
@@ -194,21 +211,19 @@ class ChannelNewsAsia(BasicNewsRecipe):
             if first_img:
                 hero_url = first_img['src']
 
-        # Build a clean HTML document so no hidden site CSS or readability filter can strip content
-        clean_soup = self.index_to_soup('<html><head><meta charset="utf-8"/></head><body></body></html>')
-        body = clean_soup.body
+        seen_imgs = set()
+        clean_elements = []
 
         if headline:
-            h1_tag = clean_soup.new_tag('h1')
+            h1_tag = soup.new_tag('h1')
             h1_tag.string = headline
-            body.append(h1_tag)
+            clean_elements.append(h1_tag)
 
-        seen_imgs = set()
         if hero_url:
             seen_imgs.add(hero_url)
-            hero_p = clean_soup.new_tag('p')
-            hero_p.append(clean_soup.new_tag('img', src=hero_url))
-            body.append(hero_p)
+            hero_p = soup.new_tag('p')
+            hero_p.append(soup.new_tag('img', src=hero_url))
+            clean_elements.append(hero_p)
 
         text_blocks = [
             div for div in root.find_all('div', class_=lambda c: c and 'text-long' in c)
@@ -218,7 +233,9 @@ class ChannelNewsAsia(BasicNewsRecipe):
             text_blocks = [root]
 
         for block in text_blocks:
-            for el in block.find_all(['p', 'h2', 'h3', 'h4', 'blockquote', 'ul', 'ol', 'img']):
+            for el in list(block.find_all(['p', 'h2', 'h3', 'h4', 'blockquote', 'ul', 'ol', 'img'])):
+                if el.attrs is None:
+                    continue
                 if el.find_parent(['blockquote', 'ul', 'ol']):
                     continue
                 if el.name == 'img' and el.find_parent('p'):
@@ -230,9 +247,9 @@ class ChannelNewsAsia(BasicNewsRecipe):
                     src = el.get('src')
                     if src and src not in seen_imgs:
                         seen_imgs.add(src)
-                        p_img = clean_soup.new_tag('p')
-                        p_img.append(clean_soup.new_tag('img', src=src))
-                        body.append(p_img)
+                        p_img = soup.new_tag('p')
+                        p_img.append(soup.new_tag('img', src=src))
+                        clean_elements.append(p_img)
                     continue
 
                 txt = ' '.join(el.get_text().split()).strip()
@@ -242,14 +259,42 @@ class ChannelNewsAsia(BasicNewsRecipe):
                 if txt and self._is_boilerplate_text(txt):
                     continue
 
-                # Strip classes/inline styles so Kindle renders crisp native text and images
-                for child in [el] + list(el.find_all(True)):
-                    if child.name == 'img':
-                        src = child.get('src')
-                        if src and src not in seen_imgs:
-                            seen_imgs.add(src)
-                            child.attrs = {'src': src}
-                        else:
-                            child.decompose()
-                    elif child.name == 'a':
-                        href = child.get('
+                for img_child in list(el.find_all('img')):
+                    if img_child.attrs is None:
+                        continue
+                    src = img_child.get('src')
+                    if src and src not in seen_imgs:
+                        seen_imgs.add(src)
+                        img_child.attrs = {'src': src}
+                    else:
+                        img_child.decompose()
+
+                for tag_child in [el] + list(el.find_all(True)):
+                    if tag_child.attrs is None or tag_child.name == 'img':
+                        continue
+                    if tag_child.name == 'a':
+                        href = tag_child.get('href')
+                        tag_child.attrs = {'href': href} if href else {}
+                    else:
+                        tag_child.attrs = {}
+
+                if el.get_text(strip=True) or el.find('img'):
+                    clean_elements.append(el.extract())
+
+        # Fallback if a special CNA layout had fewer than 2 extracted paragraphs
+        p_count = sum(1 for item in clean_elements if item.name == 'p' and item.get_text(strip=True))
+        if p_count < 2:
+            for p in list(root.find_all('p')):
+                if p.attrs is None or self._is_noise_block(p):
+                    continue
+                txt = ' '.join(p.get_text().split()).strip()
+                if len(txt) >= 40 and not self._is_boilerplate_text(txt):
+                    p_clean = soup.new_tag('p')
+                    p_clean.string = txt
+                    clean_elements.append(p_clean)
+
+        soup.body.clear()
+        for item in clean_elements:
+            soup.body.append(item)
+
+        return soup
