@@ -1,6 +1,6 @@
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from calibre.web.feeds.news import BasicNewsRecipe
 
 SGT = timezone(timedelta(hours=8))
@@ -61,6 +61,112 @@ class ChannelNewsAsia(BasicNewsRecipe):
             ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/jpeg,image/png,*/*;q=0.8'),
         ]
         return br
+
+    def _canonical_article_keys(self, url, title=''):
+        """Return normalized (canonical_url, article_id, normalized_title) for deduplication."""
+        full_url = urljoin('https://www.channelnewsasia.com/', (url or '').strip())
+        parts = urlsplit(full_url)
+        clean_path = parts.path.rstrip('/')
+        canon_url = f'https://{parts.netloc.lower()}{clean_path}'
+
+        id_match = re.search(r'-(\d{5,})$', clean_path)
+        article_id = id_match.group(1) if id_match else None
+
+        norm_title = ' '.join((title or '').lower().split()).strip()
+        return canon_url, article_id, norm_title
+
+    def _is_duplicate(self, url, title, seen_urls, seen_ids, seen_titles):
+        canon_url, article_id, norm_title = self._canonical_article_keys(url, title)
+        if canon_url and canon_url in seen_urls:
+            return True
+        if article_id and article_id in seen_ids:
+            return True
+        if norm_title and len(norm_title) >= 15 and norm_title in seen_titles:
+            return True
+
+        if canon_url:
+            seen_urls.add(canon_url)
+        if article_id:
+            seen_ids.add(article_id)
+        if norm_title and len(norm_title) >= 15:
+            seen_titles.add(norm_title)
+        return False
+
+    def _scrape_top_stories(self, seen_urls, seen_ids, seen_titles):
+        """Scrape curated Top Stories from CNA's /international landing page in editorial order."""
+        articles = []
+        article_url_re = re.compile(
+            r'^https://www\.channelnewsasia\.com/'
+            r'(?!watch/|listen/|author/|topic/|newsletters|about|contact)'
+            r'(?:[a-z0-9-]+/)+[a-z0-9-]+-\d{5,}$'
+        )
+        try:
+            soup = self.index_to_soup('https://www.channelnewsasia.com/international')
+            root = soup.find('main') or soup.body or soup
+
+            for a in root.find_all('a', href=True):
+                if a.find_parent(['nav', 'header', 'footer', 'aside']):
+                    continue
+
+                full_url = urljoin('https://www.channelnewsasia.com/', a['href'].strip())
+                canon_url, _, _ = self._canonical_article_keys(full_url)
+                if not article_url_re.match(canon_url):
+                    continue
+
+                heading = a.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+                raw_title = heading.get_text() if heading else a.get_text()
+                title = ' '.join(raw_title.split()).strip()
+
+                # Skip empty image-wrapper links or short category/CTA badges
+                if len(title) < 18 or title.lower() in ('read more', 'watch now', 'listen now'):
+                    continue
+
+                if self._is_duplicate(canon_url, title, seen_urls, seen_ids, seen_titles):
+                    continue
+
+                articles.append({
+                    'title': title,
+                    'url': canon_url,
+                    'date': '',
+                    'description': '',
+                    'content': '',
+                })
+
+                if len(articles) >= self.max_articles_per_feed:
+                    break
+        except Exception as e:
+            self.log.warning(f'Could not scrape CNA Top Stories landing page: {e}')
+
+        return articles
+
+    def parse_index(self):
+        seen_urls = set()
+        seen_ids = set()
+        seen_titles = set()
+        sections = []
+
+        # 1. Curated Top Stories first
+        top_articles = self._scrape_top_stories(seen_urls, seen_ids, seen_titles)
+        if top_articles:
+            sections.append(('Top Stories', top_articles))
+
+        # 2. RSS sections in configured order, deduplicated against Top Stories and earlier sections
+        for feed in self.parse_feeds():
+            deduped = []
+            for art in feed.articles:
+                if self._is_duplicate(art.url, art.title, seen_urls, seen_ids, seen_titles):
+                    continue
+                deduped.append({
+                    'title': art.title,
+                    'url': art.url,
+                    'date': getattr(art, 'date', '') or '',
+                    'description': getattr(art, 'summary', '') or '',
+                    'content': getattr(art, 'content', '') or '',
+                })
+            if deduped:
+                sections.append((feed.title, deduped))
+
+        return sections
 
     def _clean_img_url(self, raw_url, is_srcset=False):
         if not raw_url or not isinstance(raw_url, str):
@@ -176,7 +282,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
             font_edition = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 30)
             font_day = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 46)
             font_date = ImageFont.truetype(P('fonts/liberation/LiberationSerif-Bold.ttf'), 84)
-            font_sections = ImageFont.truetype(P('fonts/liberation/LiberationSans-Regular.ttf'), 34)
+            font_sections = ImageFont.truetype(P('fonts/liberation/LiberationSans-Regular.ttf'), 30)
 
             draw.rectangle([48, 48, width - 48, height - 48], outline='#111111', width=4)
             draw.rectangle([48, 48, width - 48, 280], fill='#111111')
@@ -191,7 +297,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
             draw.line([140, 1340, width - 140, 1340], fill='#111111', width=3)
             draw.text(
                 (width // 2, 1410),
-                'World   •   Singapore   •   Business   •   Asia',
+                'Top Stories  •  World  •  Singapore  •  Business  •  Asia',
                 fill='#222222',
                 font=font_sections,
                 anchor='mm',
