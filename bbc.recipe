@@ -1,0 +1,364 @@
+import re
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin, urlsplit
+from calibre.web.feeds.news import BasicNewsRecipe
+
+SGT = timezone(timedelta(hours=8))
+
+
+class BBCNews(BasicNewsRecipe):
+    title = 'BBC News'
+    oldest_article = 1.5
+    max_articles_per_feed = 15
+    auto_cleanup = False
+    language = 'en_GB'
+    user_agent = (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/131.0.0.0 Safari/537.36'
+    )
+    scale_news_images_to_device = True
+    compress_news_images = True
+    compress_news_images_max_size = 35
+
+    extra_css = '''
+        h1 {
+            font-size: 1.25em !important;
+            line-height: 1.25 !important;
+            margin-top: 0.2em !important;
+            margin-bottom: 0.5em !important;
+            font-weight: bold !important;
+        }
+        h2, h3, h4 {
+            font-size: 1.08em !important;
+            line-height: 1.25 !important;
+            margin-top: 0.7em !important;
+            margin-bottom: 0.3em !important;
+            font-weight: bold !important;
+        }
+    '''
+
+    feeds = [
+        ('Top Stories', 'https://feeds.bbci.co.uk/news/rss.xml'),
+        ('World', 'https://feeds.bbci.co.uk/news/world/rss.xml'),
+        ('Asia', 'https://feeds.bbci.co.uk/news/world/asia/rss.xml'),
+        ('Business', 'https://feeds.bbci.co.uk/news/business/rss.xml'),
+        ('Technology', 'https://feeds.bbci.co.uk/news/technology/rss.xml'),
+    ]
+
+    def __init__(self, *args, **kwargs):
+        now_sgt = datetime.now(SGT)
+        self.timefmt = now_sgt.strftime(' [%a, %d %b %Y]')
+        super().__init__(*args, **kwargs)
+
+    def get_browser(self):
+        br = super().get_browser()
+        br.addheaders = [
+            (k, v) for k, v in br.addheaders
+            if k.lower() not in ('accept', 'referer')
+        ]
+        br.addheaders += [
+            ('Referer', 'https://www.bbc.com/'),
+            ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/jpeg,image/png,*/*;q=0.8'),
+        ]
+        return br
+
+    def _canonical_article_keys(self, url, title=''):
+        full_url = urljoin('https://www.bbc.com/', (url or '').strip())
+        parts = urlsplit(full_url)
+        clean_path = parts.path.rstrip('/')
+        canon_url = f'https://www.bbc.com{clean_path}'
+
+        id_match = re.search(r'/(c[a-z0-9]{8,14}o|\d{7,})$', clean_path)
+        article_id = id_match.group(1) if id_match else None
+
+        norm_title = ' '.join((title or '').lower().split()).strip()
+        return canon_url, article_id, norm_title
+
+    def _is_skippable_url(self, canon_url):
+        skip_segments = ('/videos/', '/av/', '/sounds/', '/iplayer/', '/live/')
+        return any(seg in canon_url for seg in skip_segments)
+
+    def parse_index(self):
+        seen_urls = set()
+        seen_ids = set()
+        seen_titles = set()
+        sections = []
+
+        for feed in self.parse_feeds():
+            deduped = []
+            for art in feed.articles:
+                canon_url, article_id, norm_title = self._canonical_article_keys(art.url, art.title)
+                if self._is_skippable_url(canon_url):
+                    continue
+                if canon_url in seen_urls:
+                    continue
+                if article_id and article_id in seen_ids:
+                    continue
+                if norm_title and len(norm_title) >= 15 and norm_title in seen_titles:
+                    continue
+
+                seen_urls.add(canon_url)
+                if article_id:
+                    seen_ids.add(article_id)
+                if norm_title and len(norm_title) >= 15:
+                    seen_titles.add(norm_title)
+
+                deduped.append({
+                    'title': art.title,
+                    'url': canon_url,
+                    'date': getattr(art, 'date', '') or '',
+                    'description': getattr(art, 'summary', '') or '',
+                    'content': getattr(art, 'content', '') or '',
+                })
+
+            if deduped:
+                sections.append((feed.title, deduped))
+
+        return sections
+
+    def _clean_img_url(self, raw_url, is_srcset=False):
+        if not raw_url or not isinstance(raw_url, str):
+            return None
+        url = raw_url.strip()
+        if is_srcset:
+            candidates = re.split(r'\s+\d+[wx](?:,\s*|$)', url)
+            # Pick a mid-high resolution JPEG/PNG candidate rather than tiny thumbnails
+            valid = [c.strip() for c in candidates if c.strip()]
+            url = valid[-2] if len(valid) >= 2 else (valid[0] if valid else url.split()[0])
+        if not url or url.startswith('data:'):
+            return None
+        lower = url.lower()
+        skip_terms = (
+            'logo', 'icon', 'avatar', 'placeholder', 'grey-placeholder',
+            '.svg', '1x1', 'pixel', 'bbc_news_logo', 'brand'
+        )
+        if any(skip in lower for skip in skip_terms):
+            return None
+        return urljoin('https://www.bbc.com/', url)
+
+    def _extract_headline(self, soup):
+        h1 = soup.find('h1')
+        if h1:
+            txt = ' '.join(h1.get_text().split()).strip()
+            if txt:
+                return txt
+        og_title = soup.find('meta', property='og:title')
+        if og_title and og_title.get('content'):
+            txt = ' '.join(og_title['content'].split()).strip()
+            txt = re.sub(r'\s*[-|]\s*BBC(\s+News)?\s*$', '', txt, flags=re.IGNORECASE)
+            if txt:
+                return txt
+        title_tag = soup.find('title')
+        if title_tag:
+            txt = ' '.join(title_tag.get_text().split()).strip()
+            txt = re.sub(r'\s*[-|]\s*BBC(\s+News)?\s*$', '', txt, flags=re.IGNORECASE)
+            if txt:
+                return txt
+        return None
+
+    def _normalize_media(self, container, soup):
+        for picture in list(container.find_all('picture')):
+            img = picture.find('img')
+            clean_url = None
+            # Prefer <img> first so BBC serves standard JPG/PNG rather than WebP <source>
+            if img:
+                for attr, is_ss in (('data-src', False), ('src', False), ('srcset', True)):
+                    if img.get(attr):
+                        clean_url = self._clean_img_url(img[attr], is_srcset=is_ss)
+                        if clean_url:
+                            break
+            if not clean_url:
+                for source in picture.find_all('source'):
+                    if source.get('srcset') and 'webp' not in (source.get('type') or '').lower():
+                        clean_url = self._clean_img_url(source['srcset'], is_srcset=True)
+                        if clean_url:
+                            break
+            if clean_url:
+                picture.replace_with(soup.new_tag('img', src=clean_url))
+            else:
+                picture.decompose()
+
+        for img in list(container.find_all('img')):
+            if img.attrs is None:
+                continue
+            clean_url = None
+            for attr, is_ss in (('data-src', False), ('src', False), ('srcset', True)):
+                if img.get(attr):
+                    clean_url = self._clean_img_url(img[attr], is_srcset=is_ss)
+                    if clean_url:
+                        break
+            if clean_url:
+                img.attrs = {'src': clean_url}
+            else:
+                img.decompose()
+
+    def _is_noise_block(self, tag):
+        noise_components = (
+            'links-block', 'tag-list', 'related-topics',
+            'byline-block', 'social-embed', 'include-block'
+        )
+        noise_keywords = (
+            'related', 'recommended', 'promo', 'newsletter',
+            'advertisement', 'social', 'share', 'most-read'
+        )
+        for parent in [tag] + list(tag.parents):
+            if parent.name in ('nav', 'footer', 'aside', 'header'):
+                return True
+            comp = (parent.get('data-component') or '').lower()
+            if comp in noise_components:
+                return True
+            classes = ' '.join(parent.get('class', [])).lower()
+            if any(k in classes for k in noise_keywords):
+                return True
+        return False
+
+    def _is_boilerplate_text(self, text):
+        lower = text.lower()
+        phrases = (
+            'sign up for our',
+            'follow bbc news on',
+            'related topics',
+            'more on this story',
+            'top stories',
+            'bbc is not responsible for the content of external sites',
+        )
+        return any(p in lower for p in phrases)
+
+    def default_cover(self, cover_file):
+        now_sgt = datetime.now(SGT)
+        day_name = now_sgt.strftime('%A').upper()
+        date_line = now_sgt.strftime('%d %B %Y')
+        full_date = now_sgt.strftime('%A, %d %B %Y')
+
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            from calibre.utils.resources import get_path as P
+
+            width, height = 1200, 1600
+            img = Image.new('RGB', (width, height), '#FFFFFF')
+            draw = ImageDraw.Draw(img)
+
+            font_masthead = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 82)
+            font_edition = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 30)
+            font_day = ImageFont.truetype(P('fonts/liberation/LiberationSans-Bold.ttf'), 46)
+            font_date = ImageFont.truetype(P('fonts/liberation/LiberationSerif-Bold.ttf'), 84)
+            font_sections = ImageFont.truetype(P('fonts/liberation/LiberationSans-Regular.ttf'), 30)
+
+            draw.rectangle([48, 48, width - 48, height - 48], outline='#111111', width=4)
+            draw.rectangle([48, 48, width - 48, 280], fill='#111111')
+            draw.text((width // 2, 164), 'BBC NEWS', fill='#FFFFFF', font=font_masthead, anchor='mm')
+
+            draw.text((width // 2, 345), 'INTERNATIONAL DIGEST  •  SINGAPORE', fill='#333333', font=font_edition, anchor='mm')
+            draw.line([140, 395, width - 140, 395], fill='#111111', width=3)
+
+            draw.text((width // 2, 690), day_name, fill='#444444', font=font_day, anchor='mm')
+            draw.text((width // 2, 790), date_line, fill='#111111', font=font_date, anchor='mm')
+
+            draw.line([140, 1340, width - 140, 1340], fill='#111111', width=3)
+            draw.text(
+                (width // 2, 1410),
+                'Top Stories  •  World  •  Asia  •  Business  •  Tech',
+                fill='#222222',
+                font=font_sections,
+                anchor='mm',
+            )
+
+            img.save(cover_file, format='JPEG', quality=90)
+            return True
+
+        except Exception:
+            from calibre.ebooks.covers import generate_cover
+            data = generate_cover('BBC News', authors=[full_date])
+            cover_file.write(data)
+            return True
+
+    def preprocess_html(self, soup):
+        if not soup.body:
+            return soup
+
+        headline = self._extract_headline(soup)
+
+        hero_url = None
+        og_img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
+        if og_img and og_img.get('content'):
+            hero_url = self._clean_img_url(og_img['content'], is_srcset=False)
+
+        for junk in list(soup.find_all(['script', 'style', 'noscript', 'iframe', 'svg', 'form'])):
+            junk.decompose()
+
+        root = soup.find('article') or soup.find('main') or soup.body
+        self._normalize_media(root, soup)
+
+        if not hero_url:
+            first_img = root.find('img', src=True)
+            if first_img:
+                hero_url = first_img['src']
+
+        seen_imgs = set()
+        clean_elements = []
+
+        if headline:
+            h1_tag = soup.new_tag('h1')
+            h1_tag.string = headline
+            clean_elements.append(h1_tag)
+
+        if hero_url:
+            seen_imgs.add(hero_url)
+            hero_p = soup.new_tag('p')
+            hero_p.append(soup.new_tag('img', src=hero_url))
+            clean_elements.append(hero_p)
+
+        for el in list(root.find_all(['p', 'h2', 'h3', 'h4', 'blockquote', 'ul', 'ol', 'img'])):
+            if el.attrs is None:
+                continue
+            if el.find_parent(['blockquote', 'ul', 'ol']):
+                continue
+            if el.name == 'img' and el.find_parent('p'):
+                continue
+            if self._is_noise_block(el):
+                continue
+
+            if el.name == 'img':
+                src = el.get('src')
+                if src and src not in seen_imgs:
+                    seen_imgs.add(src)
+                    p_img = soup.new_tag('p')
+                    p_img.append(soup.new_tag('img', src=src))
+                    clean_elements.append(p_img)
+                continue
+
+            txt = ' '.join(el.get_text().split()).strip()
+            imgs_inside = el.find_all('img', src=True)
+            if not txt and not imgs_inside:
+                continue
+            if txt and self._is_boilerplate_text(txt):
+                continue
+
+            for img_child in list(el.find_all('img')):
+                if img_child.attrs is None:
+                    continue
+                src = img_child.get('src')
+                if src and src not in seen_imgs:
+                    seen_imgs.add(src)
+                    img_child.attrs = {'src': src}
+                else:
+                    img_child.decompose()
+
+            for tag_child in [el] + list(el.find_all(True)):
+                if tag_child.attrs is None or tag_child.name == 'img':
+                    continue
+                if tag_child.name == 'a':
+                    href = tag_child.get('href')
+                    tag_child.attrs = {'href': href} if href else {}
+                else:
+                    tag_child.attrs = {}
+
+            if el.get_text(strip=True) or el.find('img'):
+                clean_elements.append(el.extract())
+
+        soup.body.clear()
+        for item in clean_elements:
+            soup.body.append(item)
+
+        return soup
