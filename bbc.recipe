@@ -39,7 +39,6 @@ class BBCNews(BasicNewsRecipe):
     '''
 
     feeds = [
-        ('Top Stories', 'https://feeds.bbci.co.uk/news/rss.xml'),
         ('World', 'https://feeds.bbci.co.uk/news/world/rss.xml'),
         ('Asia', 'https://feeds.bbci.co.uk/news/world/asia/rss.xml'),
         ('Business', 'https://feeds.bbci.co.uk/news/business/rss.xml'),
@@ -58,26 +57,90 @@ class BBCNews(BasicNewsRecipe):
             if k.lower() not in ('accept', 'referer')
         ]
         br.addheaders += [
-            ('Referer', 'https://www.bbc.com/'),
+            ('Referer', 'https://www.bbc.com/news'),
             ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/jpeg,image/png,*/*;q=0.8'),
         ]
         return br
 
     def _canonical_article_keys(self, url, title=''):
+        """Normalize bbc.com and bbc.co.uk URLs, article IDs, and titles for deduplication."""
         full_url = urljoin('https://www.bbc.com/', (url or '').strip())
         parts = urlsplit(full_url)
         clean_path = parts.path.rstrip('/')
         canon_url = f'https://www.bbc.com{clean_path}'
 
-        id_match = re.search(r'/(c[a-z0-9]{8,14}o|\d{7,})$', clean_path)
+        id_match = re.search(r'(?:/articles/|-)(c[a-z0-9]{8,14}o|\d{7,})$', clean_path)
         article_id = id_match.group(1) if id_match else None
 
         norm_title = ' '.join((title or '').lower().split()).strip()
         return canon_url, article_id, norm_title
 
     def _is_skippable_url(self, canon_url):
-        skip_segments = ('/videos/', '/av/', '/sounds/', '/iplayer/', '/live/')
+        skip_segments = ('/videos/', '/av/', '/sounds/', '/iplayer/', '/live/', '/topics/')
         return any(seg in canon_url for seg in skip_segments)
+
+    def _is_duplicate(self, url, title, seen_urls, seen_ids, seen_titles):
+        canon_url, article_id, norm_title = self._canonical_article_keys(url, title)
+        if canon_url and canon_url in seen_urls:
+            return True
+        if article_id and article_id in seen_ids:
+            return True
+        if norm_title and len(norm_title) >= 15 and norm_title in seen_titles:
+            return True
+
+        if canon_url:
+            seen_urls.add(canon_url)
+        if article_id:
+            seen_ids.add(article_id)
+        if norm_title and len(norm_title) >= 15:
+            seen_titles.add(norm_title)
+        return False
+
+    def _scrape_bbc_news_frontpage(self, seen_urls, seen_ids, seen_titles):
+        """Scrape curated Top Stories directly from https://www.bbc.com/news in editorial order."""
+        articles = []
+        news_article_re = re.compile(
+            r'^https://www\.bbc\.com/news/(?:articles/c[a-z0-9]{8,14}o|(?:[a-z0-9-]+/)*[a-z0-9-]+-\d{7,})$'
+        )
+        try:
+            soup = self.index_to_soup('https://www.bbc.com/news')
+            root = soup.find('main') or soup.body or soup
+
+            for a in root.find_all('a', href=True):
+                if a.find_parent(['nav', 'header', 'footer', 'aside']):
+                    continue
+
+                full_url = urljoin('https://www.bbc.com/', a['href'].strip())
+                canon_url, _, _ = self._canonical_article_keys(full_url)
+                if self._is_skippable_url(canon_url):
+                    continue
+                if not news_article_re.match(canon_url):
+                    continue
+
+                heading = a.find(['h1', 'h2', 'h3', 'h4'])
+                raw_title = heading.get_text() if heading else a.get_text()
+                title = ' '.join(raw_title.split()).strip()
+
+                if len(title) < 15 or title.lower() in ('read more', 'watch', 'listen', 'live'):
+                    continue
+
+                if self._is_duplicate(canon_url, title, seen_urls, seen_ids, seen_titles):
+                    continue
+
+                articles.append({
+                    'title': title,
+                    'url': canon_url,
+                    'date': '',
+                    'description': '',
+                    'content': '',
+                })
+
+                if len(articles) >= self.max_articles_per_feed:
+                    break
+        except Exception as e:
+            self.log.warning(f'Could not scrape https://www.bbc.com/news directly: {e}')
+
+        return articles
 
     def parse_index(self):
         seen_urls = set()
@@ -85,25 +148,42 @@ class BBCNews(BasicNewsRecipe):
         seen_titles = set()
         sections = []
 
+        # 1. Curated Top Stories from https://www.bbc.com/news first
+        top_articles = self._scrape_bbc_news_frontpage(seen_urls, seen_ids, seen_titles)
+        if top_articles:
+            sections.append(('Top Stories', top_articles))
+        else:
+            # Fallback to BBC News International RSS if front-page scrape returns nothing
+            fallback_feed = self.parse_feeds_recipes_helper(
+                [('Top Stories', 'https://feeds.bbci.co.uk/news/rss.xml?edition=int')]
+            )
+            for feed in fallback_feed:
+                deduped_top = []
+                for art in feed.articles:
+                    canon_url, _, _ = self._canonical_article_keys(art.url, art.title)
+                    if self._is_skippable_url(canon_url):
+                        continue
+                    if self._is_duplicate(canon_url, art.title, seen_urls, seen_ids, seen_titles):
+                        continue
+                    deduped_top.append({
+                        'title': art.title,
+                        'url': canon_url,
+                        'date': getattr(art, 'date', '') or '',
+                        'description': getattr(art, 'summary', '') or '',
+                        'content': getattr(art, 'content', '') or '',
+                    })
+                if deduped_top:
+                    sections.append(('Top Stories', deduped_top))
+
+        # 2. Category RSS feeds deduplicated against Top Stories and earlier sections
         for feed in self.parse_feeds():
             deduped = []
             for art in feed.articles:
-                canon_url, article_id, norm_title = self._canonical_article_keys(art.url, art.title)
+                canon_url, _, _ = self._canonical_article_keys(art.url, art.title)
                 if self._is_skippable_url(canon_url):
                     continue
-                if canon_url in seen_urls:
+                if self._is_duplicate(canon_url, art.title, seen_urls, seen_ids, seen_titles):
                     continue
-                if article_id and article_id in seen_ids:
-                    continue
-                if norm_title and len(norm_title) >= 15 and norm_title in seen_titles:
-                    continue
-
-                seen_urls.add(canon_url)
-                if article_id:
-                    seen_ids.add(article_id)
-                if norm_title and len(norm_title) >= 15:
-                    seen_titles.add(norm_title)
-
                 deduped.append({
                     'title': art.title,
                     'url': canon_url,
@@ -111,7 +191,6 @@ class BBCNews(BasicNewsRecipe):
                     'description': getattr(art, 'summary', '') or '',
                     'content': getattr(art, 'content', '') or '',
                 })
-
             if deduped:
                 sections.append((feed.title, deduped))
 
@@ -123,7 +202,6 @@ class BBCNews(BasicNewsRecipe):
         url = raw_url.strip()
         if is_srcset:
             candidates = re.split(r'\s+\d+[wx](?:,\s*|$)', url)
-            # Pick a mid-high resolution JPEG/PNG candidate rather than tiny thumbnails
             valid = [c.strip() for c in candidates if c.strip()]
             url = valid[-2] if len(valid) >= 2 else (valid[0] if valid else url.split()[0])
         if not url or url.startswith('data:'):
@@ -161,7 +239,6 @@ class BBCNews(BasicNewsRecipe):
         for picture in list(container.find_all('picture')):
             img = picture.find('img')
             clean_url = None
-            # Prefer <img> first so BBC serves standard JPG/PNG rather than WebP <source>
             if img:
                 for attr, is_ss in (('data-src', False), ('src', False), ('srcset', True)):
                     if img.get(attr):
