@@ -1,5 +1,4 @@
 import re
-import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 from calibre.web.feeds.news import BasicNewsRecipe
@@ -11,13 +10,8 @@ class ChannelNewsAsia(BasicNewsRecipe):
     title = 'Channel NewsAsia'
     oldest_article = 1.5
     max_articles_per_feed = 15
-    auto_cleanup = True
+    auto_cleanup = False
     language = 'en_SG'
-    user_agent = (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/131.0.0.0 Safari/537.36'
-    )
     scale_news_images_to_device = True
     compress_news_images = True
     compress_news_images_max_size = 35
@@ -32,7 +26,6 @@ class ChannelNewsAsia(BasicNewsRecipe):
     def __init__(self, *args, **kwargs):
         now_sgt = datetime.now(SGT)
         self.timefmt = now_sgt.strftime(' [%a, %d %b %Y]')
-        self._article_meta = {}
         super().__init__(*args, **kwargs)
 
     def get_browser(self):
@@ -67,6 +60,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
         og_title = soup.find('meta', property='og:title')
         if og_title and og_title.get('content'):
             txt = ' '.join(og_title['content'].split()).strip()
+            txt = re.sub(r'\s*[-|]\s*(CNA|Channel NewsAsia)\s*$', '', txt, flags=re.IGNORECASE)
             if txt:
                 return txt
         title_tag = soup.find('title')
@@ -76,6 +70,62 @@ class ChannelNewsAsia(BasicNewsRecipe):
             if txt:
                 return txt
         return None
+
+    def _normalize_media(self, container, soup):
+        for picture in container.find_all('picture'):
+            img = picture.find('img')
+            source = picture.find('source')
+            clean_url = None
+            if source and source.get('srcset'):
+                clean_url = self._clean_img_url(source['srcset'], is_srcset=True)
+            if not clean_url and img:
+                for attr, is_ss in (('data-src', False), ('data-original', False), ('srcset', True), ('src', False)):
+                    if img.get(attr):
+                        clean_url = self._clean_img_url(img[attr], is_srcset=is_ss)
+                        if clean_url:
+                            break
+            if clean_url:
+                picture.replace_with(soup.new_tag('img', src=clean_url))
+            else:
+                picture.decompose()
+
+        for img in container.find_all('img'):
+            clean_url = None
+            for attr, is_ss in (('data-src', False), ('data-original', False), ('srcset', True), ('src', False)):
+                if img.get(attr):
+                    clean_url = self._clean_img_url(img[attr], is_srcset=is_ss)
+                    if clean_url:
+                        break
+            if clean_url:
+                img.attrs = {'src': clean_url}
+            else:
+                img.decompose()
+
+    def _is_noise_block(self, tag):
+        noise_keywords = (
+            'related', 'recommended', 'card', 'teaser',
+            'newsletter', 'advertisement', 'promo', 'social', 'share'
+        )
+        for parent in [tag] + list(tag.parents):
+            if parent.name in ('nav', 'footer', 'aside', 'header'):
+                return True
+            classes = ' '.join(parent.get('class', [])).lower()
+            if any(k in classes for k in noise_keywords):
+                return True
+        return False
+
+    def _is_boilerplate_text(self, text):
+        lower = text.lower()
+        phrases = (
+            'subscribe to our',
+            'download our app',
+            'get our pick of top stories',
+            'sign up for our newsletters',
+            'this service is not intended for persons residing in the eu',
+            'also worth reading',
+            'related topics',
+        )
+        return any(p in lower for p in phrases)
 
     def default_cover(self, cover_file):
         now_sgt = datetime.now(SGT)
@@ -125,8 +175,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
             cover_file.write(data)
             return True
 
-    def preprocess_raw_html(self, raw_html, url):
-        soup = self.index_to_soup(raw_html)
+    def preprocess_html(self, soup):
         headline = self._extract_headline(soup)
 
         hero_url = None
@@ -134,136 +183,73 @@ class ChannelNewsAsia(BasicNewsRecipe):
         if og_img and og_img.get('content'):
             hero_url = self._clean_img_url(og_img['content'], is_srcset=False)
 
-        token = 'CNAMARKER' + uuid.uuid4().hex.upper()
-        self._article_meta[token] = {
-            'headline': headline,
-            'hero_url': hero_url,
-        }
+        for junk in soup.find_all(['script', 'style', 'noscript', 'iframe', 'svg', 'form']):
+            junk.decompose()
 
-        # Convert <picture> elements with a text guard so readability preserves inline photos
-        for picture in soup.find_all('picture'):
-            img = picture.find('img')
-            source = picture.find('source')
-            clean_url = None
+        root = soup.find('main') or soup.find('article') or soup.body or soup
+        self._normalize_media(root, soup)
 
-            if source and source.get('srcset'):
-                clean_url = self._clean_img_url(source['srcset'], is_srcset=True)
-            if not clean_url and img:
-                for attr, is_ss in (('data-src', False), ('data-original', False), ('srcset', True), ('src', False)):
-                    if img.get(attr):
-                        clean_url = self._clean_img_url(img[attr], is_srcset=is_ss)
-                        if clean_url:
-                            break
+        if not hero_url:
+            first_img = root.find('img', src=True)
+            if first_img:
+                hero_url = first_img['src']
 
-            if clean_url:
-                if not hero_url:
-                    self._article_meta[token]['hero_url'] = clean_url
-                    hero_url = clean_url
-                p_tag = soup.new_tag('p')
-                p_tag.string = 'CNAIMGKEEPSEGMENT '
-                p_tag.append(soup.new_tag('img', src=clean_url))
-                picture.replace_with(p_tag)
-            else:
-                picture.decompose()
+        # Build a clean HTML document so no hidden site CSS or readability filter can strip content
+        clean_soup = self.index_to_soup('<html><head><meta charset="utf-8"/></head><body></body></html>')
+        body = clean_soup.body
 
-        # Normalize standalone lazy-loaded <img> tags
-        for img in soup.find_all('img'):
-            clean_url = None
-            for attr, is_ss in (('data-src', False), ('data-original', False), ('srcset', True), ('src', False)):
-                if img.get(attr):
-                    clean_url = self._clean_img_url(img[attr], is_srcset=is_ss)
-                    if clean_url:
-                        break
+        if headline:
+            h1_tag = clean_soup.new_tag('h1')
+            h1_tag.string = headline
+            body.append(h1_tag)
 
-            if clean_url:
-                if not hero_url:
-                    self._article_meta[token]['hero_url'] = clean_url
-                    hero_url = clean_url
-                img['src'] = clean_url
-                for attr in ('data-src', 'data-original', 'srcset', 'loading'):
-                    if attr in img.attrs:
-                        del img.attrs[attr]
-            else:
-                img.decompose()
+        seen_imgs = set()
+        if hero_url:
+            seen_imgs.add(hero_url)
+            hero_p = clean_soup.new_tag('p')
+            hero_p.append(clean_soup.new_tag('img', src=hero_url))
+            body.append(hero_p)
 
-        # Anchor a plain-text marker paragraph right before the first substantial paragraph
-        target_p = None
-        for p in soup.find_all('p'):
-            txt = p.get_text(strip=True)
-            if len(txt) >= 40 and not txt.startswith('CNAIMGKEEPSEGMENT'):
-                target_p = p
-                break
-        if not target_p:
-            container = soup.find('article') or soup.find('main') or soup.body
-            if container:
-                target_p = container.find('p')
+        text_blocks = [
+            div for div in root.find_all('div', class_=lambda c: c and 'text-long' in c)
+            if not self._is_noise_block(div)
+        ]
+        if not text_blocks:
+            text_blocks = [root]
 
-        marker_p = soup.new_tag('p')
-        marker_p.string = f'{token} article metadata placeholder text'
-        if target_p:
-            target_p.insert_before(marker_p)
-        elif soup.body:
-            soup.body.insert(0, marker_p)
+        for block in text_blocks:
+            for el in block.find_all(['p', 'h2', 'h3', 'h4', 'blockquote', 'ul', 'ol', 'img']):
+                if el.find_parent(['blockquote', 'ul', 'ol']):
+                    continue
+                if el.name == 'img' and el.find_parent('p'):
+                    continue
+                if self._is_noise_block(el):
+                    continue
 
-        return str(soup)
+                if el.name == 'img':
+                    src = el.get('src')
+                    if src and src not in seen_imgs:
+                        seen_imgs.add(src)
+                        p_img = clean_soup.new_tag('p')
+                        p_img.append(clean_soup.new_tag('img', src=src))
+                        body.append(p_img)
+                    continue
 
-    def postprocess_html(self, soup, first_fetch):
-        meta = {}
-        for p in soup.find_all('p'):
-            txt = p.get_text(strip=True)
-            if txt.startswith('CNAMARKER'):
-                token = txt.split()[0]
-                meta = self._article_meta.pop(token, {})
-                p.decompose()
-                break
+                txt = ' '.join(el.get_text().split()).strip()
+                imgs_inside = el.find_all('img', src=True)
+                if not txt and not imgs_inside:
+                    continue
+                if txt and self._is_boilerplate_text(txt):
+                    continue
 
-        # Strip temporary text guard from inline image paragraphs
-        for p in soup.find_all('p'):
-            if p.find('img'):
-                for node in list(p.children):
-                    if isinstance(node, str) and 'CNAIMGKEEPSEGMENT' in node:
-                        cleaned = node.replace('CNAIMGKEEPSEGMENT', '').strip()
-                        if cleaned:
-                            node.replace_with(cleaned)
+                # Strip classes/inline styles so Kindle renders crisp native text and images
+                for child in [el] + list(el.find_all(True)):
+                    if child.name == 'img':
+                        src = child.get('src')
+                        if src and src not in seen_imgs:
+                            seen_imgs.add(src)
+                            child.attrs = {'src': src}
                         else:
-                            node.extract()
-
-        headline = meta.get('headline')
-        hero_url = meta.get('hero_url')
-
-        # Guarantee a single top-level <h1> headline on every article
-        existing_h1 = soup.find('h1')
-        if not headline and existing_h1:
-            headline = ' '.join(existing_h1.get_text().split()).strip()
-        for h1 in soup.find_all('h1'):
-            h1.decompose()
-
-        if headline and soup.body:
-            new_h1 = soup.new_tag('h1')
-            new_h1.string = headline
-            soup.body.insert(0, new_h1)
-
-        # Insert the lead image immediately under <h1> so Calibre downloads and embeds it
-        existing_srcs = {img.get('src') for img in soup.find_all('img') if img.get('src')}
-        if hero_url and hero_url not in existing_srcs and soup.body:
-            img_p = soup.new_tag('p')
-            img_p.append(soup.new_tag('img', src=hero_url))
-            top_h1 = soup.find('h1')
-            if top_h1:
-                top_h1.insert_after(img_p)
-            else:
-                soup.body.insert(0, img_p)
-
-        # Remove duplicate consecutive images
-        prev_src = None
-        for img in soup.find_all('img'):
-            src = img.get('src')
-            if src and src == prev_src:
-                parent = img.parent
-                img.decompose()
-                if parent and parent.name == 'p' and not parent.get_text(strip=True) and not parent.find('img'):
-                    parent.decompose()
-            else:
-                prev_src = src
-
-        return soup
+                            child.decompose()
+                    elif child.name == 'a':
+                        href = child.get('
