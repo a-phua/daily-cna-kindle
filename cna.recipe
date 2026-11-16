@@ -1,4 +1,4 @@
-import uuid
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 from calibre.web.feeds.news import BasicNewsRecipe
@@ -13,9 +13,8 @@ class ChannelNewsAsia(BasicNewsRecipe):
     auto_cleanup = True
     language = 'en_SG'
     user_agent = (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-        'AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/131.0.0.0 Safari/537.36'
+        'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) '
+        'Gecko/20100101 Firefox/128.0'
     )
     scale_news_images_to_device = True
     compress_news_images = True
@@ -31,7 +30,6 @@ class ChannelNewsAsia(BasicNewsRecipe):
     def __init__(self, *args, **kwargs):
         now_sgt = datetime.now(SGT)
         self.timefmt = now_sgt.strftime(' [%a, %d %b %Y]')
-        self._hero_images = {}
         super().__init__(*args, **kwargs)
 
     def _clean_img_url(self, raw_url, is_srcset=False):
@@ -39,15 +37,33 @@ class ChannelNewsAsia(BasicNewsRecipe):
             return None
         url = raw_url.strip()
         if is_srcset:
-            parts = url.split()
-            url = parts[0] if parts else ''
+            candidates = re.split(r'\s+\d+[wx](?:,\s*|$)', url)
+            url = candidates[0].strip() if candidates and candidates[0].strip() else url.split()[0]
         if not url or url.startswith('data:'):
             return None
         lower = url.lower()
         if any(skip in lower for skip in ('logo', 'icon', 'avatar', 'placeholder', '.svg', '1x1', 'pixel')):
             return None
-        # Do not alter path parameters (like f_auto) as Mediacorp/Cloudinary URLs are signed
         return urljoin('https://www.channelnewsasia.com/', url)
+
+    def _extract_headline(self, soup):
+        h1 = soup.find('h1')
+        if h1:
+            txt = ' '.join(h1.get_text().split()).strip()
+            if txt:
+                return txt
+        og_title = soup.find('meta', property='og:title')
+        if og_title and og_title.get('content'):
+            txt = ' '.join(og_title['content'].split()).strip()
+            if txt:
+                return txt
+        title_tag = soup.find('title')
+        if title_tag:
+            txt = ' '.join(title_tag.get_text().split()).strip()
+            txt = re.sub(r'\s*[-|]\s*(CNA|Channel NewsAsia)\s*$', '', txt, flags=re.IGNORECASE)
+            if txt:
+                return txt
+        return None
 
     def default_cover(self, cover_file):
         now_sgt = datetime.now(SGT)
@@ -98,13 +114,16 @@ class ChannelNewsAsia(BasicNewsRecipe):
             return True
 
     def preprocess_html(self, soup):
-        # Capture the lead article image before auto_cleanup strips <head> and hero wrappers
+        # 1. Capture headline and hero image BEFORE auto_cleanup strips <head> and outer wrappers
+        headline = self._extract_headline(soup)
+
         hero_url = None
         og_img = soup.find('meta', property='og:image') or soup.find('meta', attrs={'name': 'twitter:image'})
         if og_img and og_img.get('content'):
             hero_url = self._clean_img_url(og_img['content'], is_srcset=False)
 
-        # Convert inline <picture> tags into <p><img ...></p> so auto_cleanup keeps them
+        # 2. Convert <picture> elements into plain <p><img src="..."></p>
+        body_imgs = []
         for picture in soup.find_all('picture'):
             img = picture.find('img')
             source = picture.find('source')
@@ -120,8 +139,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
                             break
 
             if clean_url:
-                if not hero_url:
-                    hero_url = clean_url
+                body_imgs.append(clean_url)
                 p_tag = soup.new_tag('p')
                 new_img = soup.new_tag('img', src=clean_url)
                 p_tag.append(new_img)
@@ -129,7 +147,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
             else:
                 picture.decompose()
 
-        # Normalize standalone lazy-loaded <img> tags
+        # 3. Normalize standalone lazy-loaded <img> tags
         for img in soup.find_all('img'):
             clean_url = None
             for attr, is_ss in (('data-src', False), ('data-original', False), ('srcset', True), ('src', False)):
@@ -139,8 +157,7 @@ class ChannelNewsAsia(BasicNewsRecipe):
                         break
 
             if clean_url:
-                if not hero_url:
-                    hero_url = clean_url
+                body_imgs.append(clean_url)
                 img['src'] = clean_url
                 for attr in ('data-src', 'data-original', 'srcset', 'loading'):
                     if attr in img.attrs:
@@ -148,33 +165,57 @@ class ChannelNewsAsia(BasicNewsRecipe):
             else:
                 img.decompose()
 
-        if hero_url:
-            uid = uuid.uuid4().hex
-            self._hero_images[uid] = hero_url
-            for tag in soup.find_all(['h1', 'p']):
-                tag['data-cna-uid'] = uid
+        # 4. Inject headline + hero image directly inside the main article <p> block
+        # so auto_cleanup keeps both AND Calibre downloads the image into the EPUB
+        target_p = None
+        for p in soup.find_all('p'):
+            if len(p.get_text(strip=True)) >= 40:
+                target_p = p
+                break
+        if not target_p:
+            container = soup.find('article') or soup.find('main') or soup.body
+            if container:
+                target_p = container.find('p')
+
+        if target_p:
+            if headline:
+                h1_marker = soup.new_tag('h2', **{'class': 'cna-preserved-title'})
+                h1_marker.string = headline
+                target_p.insert_before(h1_marker)
+
+            if hero_url and hero_url not in body_imgs:
+                img_p = soup.new_tag('p')
+                img_p.append(soup.new_tag('img', src=hero_url))
+                target_p.insert_before(img_p)
 
         return soup
 
     def postprocess_html(self, soup, first_fetch):
-        uid = None
-        tagged = soup.find(attrs={'data-cna-uid': True})
-        if tagged:
-            uid = tagged.get('data-cna-uid')
-        for tag in soup.find_all(attrs={'data-cna-uid': True}):
-            del tag.attrs['data-cna-uid']
+        # Ensure every article starts with a top-level <h1> headline
+        preserved = soup.find('h2', class_='cna-preserved-title')
+        existing_h1 = soup.find('h1')
 
-        hero_url = self._hero_images.pop(uid, None) if uid else None
-        existing_srcs = {img.get('src') for img in soup.find_all('img') if img.get('src')}
+        if existing_h1:
+            if preserved:
+                preserved.decompose()
+            if soup.body:
+                soup.body.insert(0, existing_h1.extract())
+        elif preserved:
+            preserved.name = 'h1'
+            del preserved.attrs['class']
+            if soup.body:
+                soup.body.insert(0, preserved.extract())
 
-        if hero_url and hero_url not in existing_srcs:
-            p_tag = soup.new_tag('p')
-            img_tag = soup.new_tag('img', src=hero_url)
-            p_tag.append(img_tag)
-            h1 = soup.find('h1')
-            if h1 and h1.parent:
-                h1.insert_after(p_tag)
-            elif soup.body:
-                soup.body.insert(0, p_tag)
+        # Remove duplicate consecutive images
+        prev_src = None
+        for img in soup.find_all('img'):
+            src = img.get('src')
+            if src and src == prev_src:
+                parent = img.parent
+                img.decompose()
+                if parent and parent.name == 'p' and not parent.get_text(strip=True) and not parent.find('img'):
+                    parent.decompose()
+            else:
+                prev_src = src
 
         return soup
