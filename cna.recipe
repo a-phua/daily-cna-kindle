@@ -21,6 +21,23 @@ class ChannelNewsAsia(BasicNewsRecipe):
     compress_news_images = True
     compress_news_images_max_size = 35
 
+    extra_css = '''
+        h1 {
+            font-size: 1.25em !important;
+            line-height: 1.25 !important;
+            margin-top: 0.2em !important;
+            margin-bottom: 0.5em !important;
+            font-weight: bold !important;
+        }
+        h2, h3, h4 {
+            font-size: 1.08em !important;
+            line-height: 1.25 !important;
+            margin-top: 0.7em !important;
+            margin-bottom: 0.3em !important;
+            font-weight: bold !important;
+        }
+    '''
+
     feeds = [
         ('World', 'https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=6311'),
         ('Singapore', 'https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=10416'),
